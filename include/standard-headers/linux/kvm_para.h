@@ -31,6 +31,7 @@
 #define KVM_HC_SCHED_YIELD		11
 #define KVM_HC_MAP_GPA_RANGE		12
 #define KVM_HC_VM_PLANES_CONFIG		13
+#define KVM_HC_VM_PLANES_ACTIVATE	14
 
 /*
  * hypercalls use architecture specific

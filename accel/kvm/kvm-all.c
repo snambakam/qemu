@@ -770,6 +770,30 @@ void kvm_close(void)
     }
 
     if (kvm_state && kvm_state->fd != -1) {
+        /* Clean up VM plane state */
+        if (kvm_state->vm_planes) {
+            unsigned int i, j;
+
+            for (i = 1; i < kvm_state->vm_plane_count; i++) {
+                struct kvm_vm_plane_state *ps = &kvm_state->vm_planes[i];
+
+                if (ps->vcpu_fds) {
+                    for (j = 0; j < ps->vcpu_count; j++) {
+                        if (ps->vcpu_fds[j] >= 0) {
+                            close(ps->vcpu_fds[j]);
+                        }
+                    }
+                    g_free(ps->vcpu_fds);
+                }
+                if (ps->plane_fd >= 0) {
+                    close(ps->plane_fd);
+                }
+            }
+            g_free(kvm_state->vm_planes);
+            kvm_state->vm_planes = NULL;
+            kvm_state->vm_plane_count = 0;
+        }
+
         close(kvm_state->vmfd);
         kvm_state->vmfd = -1;
         close(kvm_state->fd);

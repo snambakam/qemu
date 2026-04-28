@@ -168,6 +168,17 @@ struct KVMState
     uint16_t xen_evtchn_max_pirq;
     char *device;
     OnOffAuto honor_guest_pat;
+
+    /* VM planes state */
+    struct kvm_vm_plane_state {
+        int plane_fd;
+        int *vcpu_fds;
+        unsigned int vcpu_count;
+        uint64_t load_offset;
+        uint64_t memory_size;
+    } *vm_planes;
+    unsigned int vm_plane_count;
+    unsigned int vm_planes_max;
 };
 
 void kvm_memory_listener_register(KVMState *s, KVMMemoryListener *kml,

@@ -6518,9 +6518,12 @@ static int kvm_handle_hc_map_gpa_range(X86CPU *cpu, struct kvm_run *run)
     return 0;
 }
 
-/* VM planes ioctls not yet in linux-headers — defined in kernel's kvm.h */
+/* VM planes ioctls/caps not yet in linux-headers — defined in kernel's kvm.h */
 #define KVM_CREATE_PLANE        _IO(0xAE, 0xd6)
 #define KVM_CREATE_VCPU_PLANE   _IO(0xAE, 0xd7)
+#define KVM_CAP_PLANES          248
+
+#define VM_PLANE_VCPUS_MAX      64
 
 static int kvm_handle_hc_vm_planes_config(X86CPU *cpu, struct kvm_run *run)
 {
@@ -6529,11 +6532,33 @@ static int kvm_handle_hc_vm_planes_config(X86CPU *cpu, struct kvm_run *run)
     uint64_t plane_id;
     unsigned int next_vcpu_id;
     CPUState *cs;
+    KVMState *s = kvm_state;
 
-    if (!gpa || !plane_count || plane_count > 16) {
+    if (!gpa || !plane_count) {
         run->hypercall.ret = -EINVAL;
         return 0;
     }
+
+    /* Query KVM for the maximum number of planes supported. */
+    if (!s->vm_planes_max) {
+        int max = kvm_vm_ioctl(s, KVM_CHECK_EXTENSION, KVM_CAP_PLANES);
+        if (max <= 0) {
+            error_report("vm_planes: KVM does not support planes");
+            run->hypercall.ret = -ENOTSUP;
+            return 0;
+        }
+        s->vm_planes_max = max;
+    }
+
+    if (plane_count > s->vm_planes_max) {
+        error_report("vm_planes: requested %" PRIu64 " planes but KVM "
+                     "supports %u", plane_count, s->vm_planes_max);
+        run->hypercall.ret = -EINVAL;
+        return 0;
+    }
+
+    s->vm_planes = g_new0(struct kvm_vm_plane_state, plane_count);
+    s->vm_plane_count = plane_count;
 
     /* Determine the next available vCPU ID (one past the highest existing). */
     next_vcpu_id = 0;
@@ -6556,6 +6581,7 @@ static int kvm_handle_hc_vm_planes_config(X86CPU *cpu, struct kvm_run *run)
         uint64_t plane_gpa = gpa + (plane_id * 152);
         uint64_t load_offset = 0, memory_size = 0;
         uint32_t vcpu_count = 0;
+        struct kvm_vm_plane_state *ps = &s->vm_planes[plane_id];
         MemTxResult res;
         MemoryRegion *mr;
         Error *err = NULL;
@@ -6600,7 +6626,7 @@ static int kvm_handle_hc_vm_planes_config(X86CPU *cpu, struct kvm_run *run)
          * Step 1: Create the KVM plane object. KVM_CREATE_PLANE takes the
          * plane ID as argument and returns a plane fd.
          */
-        plane_fd = kvm_vm_ioctl(kvm_state, KVM_CREATE_PLANE, (int)plane_id);
+        plane_fd = kvm_vm_ioctl(s, KVM_CREATE_PLANE, (int)plane_id);
         if (plane_fd < 0) {
             error_report("vm_planes: KVM_CREATE_PLANE failed for plane %"
                          PRIu64 ": %s", plane_id, strerror(errno));
@@ -6636,10 +6662,12 @@ static int kvm_handle_hc_vm_planes_config(X86CPU *cpu, struct kvm_run *run)
          *   b) KVM_CREATE_VCPU_PLANE on the plane fd, passing the vCPU fd,
          *      to assign the vCPU to the plane.
          */
+        ps->vcpu_fds = g_new0(int, vcpu_count);
+
         for (i = 0; i < vcpu_count; i++) {
             int vcpu_fd, ret;
 
-            vcpu_fd = kvm_vm_ioctl(kvm_state, KVM_CREATE_VCPU, next_vcpu_id);
+            vcpu_fd = kvm_vm_ioctl(s, KVM_CREATE_VCPU, next_vcpu_id);
             if (vcpu_fd < 0) {
                 error_report("vm_planes: KVM_CREATE_VCPU failed for plane %"
                              PRIu64 " vcpu %u: %s",
@@ -6650,24 +6678,146 @@ static int kvm_handle_hc_vm_planes_config(X86CPU *cpu, struct kvm_run *run)
             }
 
             ret = ioctl(plane_fd, KVM_CREATE_VCPU_PLANE, vcpu_fd);
-            close(vcpu_fd);
             if (ret < 0) {
                 error_report("vm_planes: KVM_CREATE_VCPU_PLANE failed for "
                              "plane %" PRIu64 " vcpu %u: %s",
                              plane_id, next_vcpu_id, strerror(errno));
+                close(vcpu_fd);
                 close(plane_fd);
                 run->hypercall.ret = -errno;
                 return 0;
             }
 
+            ps->vcpu_fds[i] = vcpu_fd;
             next_vcpu_id++;
         }
 
-        close(plane_fd);
+        ps->plane_fd = plane_fd;
+        ps->vcpu_count = vcpu_count;
+        ps->load_offset = load_offset;
+        ps->memory_size = memory_size;
 
         info_report("vm_planes: plane %" PRIu64 " ready — GPA 0x%" PRIx64
                     " size 0x%" PRIx64 " vcpus %u",
                     plane_id, load_offset, memory_size, vcpu_count);
+    }
+
+    run->hypercall.ret = 0;
+    return 0;
+}
+
+static int kvm_init_plane_vcpu(int vcpu_fd, uint64_t entry_addr,
+                               uint64_t stack_addr)
+{
+    struct kvm_regs regs = {};
+    struct kvm_sregs sregs = {};
+    struct kvm_mp_state mp = { .mp_state = KVM_MP_STATE_RUNNABLE };
+    int ret;
+
+    /*
+     * Set up 64-bit long mode state.  The loaded kernel image starts
+     * executing at entry_addr with a stack at the top of plane memory.
+     */
+
+    /* Segment descriptors for flat 64-bit code/data */
+    sregs.cs.base = 0;
+    sregs.cs.limit = 0xffffffff;
+    sregs.cs.selector = 0x10;
+    sregs.cs.type = 0xb;    /* execute/read, accessed */
+    sregs.cs.present = 1;
+    sregs.cs.dpl = 0;
+    sregs.cs.db = 0;
+    sregs.cs.s = 1;
+    sregs.cs.l = 1;         /* 64-bit mode */
+    sregs.cs.g = 1;
+
+    sregs.ds.base = 0;
+    sregs.ds.limit = 0xffffffff;
+    sregs.ds.selector = 0x18;
+    sregs.ds.type = 0x3;    /* read/write, accessed */
+    sregs.ds.present = 1;
+    sregs.ds.dpl = 0;
+    sregs.ds.db = 1;
+    sregs.ds.s = 1;
+    sregs.ds.g = 1;
+
+    sregs.es = sregs.ds;
+    sregs.ss = sregs.ds;
+
+    /* Control registers for 64-bit mode with paging disabled initially */
+    sregs.cr0 = (1u << 0)   /* PE - protected mode */
+              | (1u << 4);   /* ET - x87 extension type */
+    sregs.cr4 = (1u << 5);  /* PAE */
+    sregs.efer = (1u << 8)  /* LME - long mode enable */
+               | (1u << 10); /* LMA - long mode active */
+
+    ret = ioctl(vcpu_fd, KVM_SET_SREGS, &sregs);
+    if (ret < 0) {
+        error_report("vm_planes: KVM_SET_SREGS failed: %s", strerror(errno));
+        return -errno;
+    }
+
+    /* General purpose registers */
+    regs.rip = entry_addr;
+    regs.rsp = stack_addr;
+    regs.rflags = 0x2;  /* reserved bit */
+
+    ret = ioctl(vcpu_fd, KVM_SET_REGS, &regs);
+    if (ret < 0) {
+        error_report("vm_planes: KVM_SET_REGS failed: %s", strerror(errno));
+        return -errno;
+    }
+
+    /* Make the vCPU runnable */
+    ret = ioctl(vcpu_fd, KVM_SET_MP_STATE, &mp);
+    if (ret < 0) {
+        error_report("vm_planes: KVM_SET_MP_STATE failed: %s",
+                     strerror(errno));
+        return -errno;
+    }
+
+    return 0;
+}
+
+static int kvm_handle_hc_vm_planes_activate(X86CPU *cpu, struct kvm_run *run)
+{
+    uint64_t plane_count = run->hypercall.args[0];
+    uint64_t plane_id;
+    KVMState *s = kvm_state;
+
+    if (!plane_count || plane_count > s->vm_planes_max ||
+        plane_count != s->vm_plane_count) {
+        run->hypercall.ret = -EINVAL;
+        return 0;
+    }
+
+    for (plane_id = 1; plane_id < plane_count; plane_id++) {
+        struct kvm_vm_plane_state *ps = &s->vm_planes[plane_id];
+        uint64_t entry_addr = ps->load_offset;
+        uint64_t stack_addr = ps->load_offset + ps->memory_size;
+        unsigned int i;
+
+        if (!ps->plane_fd || !ps->vcpu_count) {
+            error_report("vm_planes: plane %" PRIu64 " not configured",
+                         plane_id);
+            run->hypercall.ret = -EINVAL;
+            return 0;
+        }
+
+        for (i = 0; i < ps->vcpu_count; i++) {
+            int ret = kvm_init_plane_vcpu(ps->vcpu_fds[i],
+                                          entry_addr, stack_addr);
+            if (ret) {
+                error_report("vm_planes: failed to init plane %" PRIu64
+                             " vcpu %u", plane_id, i);
+                run->hypercall.ret = ret;
+                return 0;
+            }
+        }
+
+        info_report("vm_planes: plane %" PRIu64 " activated — entry 0x%"
+                    PRIx64 " stack 0x%" PRIx64 " vcpus %u",
+                    plane_id, entry_addr, stack_addr, ps->vcpu_count);
     }
 
     run->hypercall.ret = 0;
@@ -6680,6 +6830,8 @@ static int kvm_handle_hypercall(X86CPU *cpu, struct kvm_run *run)
         return kvm_handle_hc_map_gpa_range(cpu, run);
     if (run->hypercall.nr == KVM_HC_VM_PLANES_CONFIG)
         return kvm_handle_hc_vm_planes_config(cpu, run);
+    if (run->hypercall.nr == KVM_HC_VM_PLANES_ACTIVATE)
+        return kvm_handle_hc_vm_planes_activate(cpu, run);
 
     return -EINVAL;
 }
