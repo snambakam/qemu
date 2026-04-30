@@ -176,6 +176,8 @@ struct KVMState
         unsigned int vcpu_count;
         uint64_t load_offset;
         uint64_t memory_size;
+        uint64_t entry_point;
+        char cmdline[512];
     } *vm_planes;
     unsigned int vm_plane_count;
     unsigned int vm_planes_max;
