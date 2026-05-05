@@ -7303,9 +7303,9 @@ static int kvm_handle_hc_vm_planes_activate(X86CPU *cpu, struct kvm_run *run)
              * Entries start at offset 0xd00, count at offset 0x1e8.
              * E820_TYPE_RAM = 1
              *
-             * The kernel needs:
-             *   - The plane memory region containing kernel text/data
-             *   With CONFIG_SMP=n on the plane kernel, no low memory is needed.
+             * The full plane memory region is reported as a single RAM entry.
+             * This includes the sub-1MB area needed for SMP trampoline and
+             * the kernel text/data loaded at CONFIG_PHYSICAL_START (16MB).
              */
             {
                 struct {
