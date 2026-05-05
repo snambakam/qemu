@@ -177,6 +177,7 @@ struct KVMState
         uint64_t load_offset;
         uint64_t memory_size;
         uint64_t entry_point;
+        void *host_addr;        /* mmap'd host buffer for plane RAM */
         char cmdline[512];
     } *vm_planes;
     unsigned int vm_plane_count;
