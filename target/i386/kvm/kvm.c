@@ -3591,9 +3591,10 @@ int kvm_arch_init(MachineState *ms, KVMState *s)
         kvm_vmfd_add_change_notifier(&kvm_vmfd_change_notifier);
     }
 
-    /* Enable userspace exit for VM planes hypercalls. */
+    /* Enable userspace exit for VM planes and VBS hypercalls. */
     if (!kvm_enable_hypercall(BIT_ULL(KVM_HC_VM_PLANES_CONFIG) |
-                              BIT_ULL(KVM_HC_VM_PLANES_ACTIVATE))) {
+                              BIT_ULL(KVM_HC_VM_PLANES_ACTIVATE) |
+                              BIT_ULL(KVM_HC_VBS_VTL_CALL))) {
         warn_report("kvm: failed to enable VM planes hypercall exit");
     }
 
@@ -7515,11 +7516,84 @@ static int kvm_handle_hc_vm_planes_activate(X86CPU *cpu, struct kvm_run *run)
         /* Don't join/free threads — they continue running for the plane's
          * lifetime. The plane vCPUs run concurrently with plane-0. */
 
+        /*
+         * Seal plane-1's memory:
+         *
+         * 1. Set NO_WRITE|NO_EXEC on plane-0's EPT for the GPA range
+         *    occupied by plane-1.  This prevents the plane-0 guest from
+         *    writing to or executing plane-1's memory through KVM.
+         *
+         * 2. Clear the host_addr so QEMU userspace can no longer access
+         *    the region either.  Plane vCPU threads use KVM_RUN which
+         *    accesses guest memory through kernel-side mappings.
+         */
+        {
+            struct kvm_plane_memory_attributes pattrs = {
+                .plane      = 0,    /* restrict plane-0's view */
+                .flags      = 0,
+                .address    = ps->load_offset,
+                .size       = ps->memory_size,
+                .attributes = KVM_MEMORY_ATTRIBUTE_NO_WRITE |
+                              KVM_MEMORY_ATTRIBUTE_NO_EXEC,
+            };
+            int prot_ret = kvm_vm_ioctl(s, KVM_SET_PLANE_MEMORY_ATTRIBUTES,
+                                        &pattrs);
+            if (prot_ret < 0) {
+                warn_report("vm_planes: plane %" PRIu64 " failed to set "
+                            "NO_WRITE|NO_EXEC on plane-0 EPT (err %d) — "
+                            "plane-0 guest can still access plane-1 memory",
+                            plane_id, prot_ret);
+            } else {
+                info_report("vm_planes: plane %" PRIu64 " memory "
+                            "[0x%" PRIx64 "+0x%" PRIx64 "] sealed "
+                            "(plane-0 EPT: NO_WRITE|NO_EXEC)",
+                            plane_id, ps->load_offset, ps->memory_size);
+            }
+        }
+        ps->host_addr = NULL;
+
         info_report("vm_planes: plane %" PRIu64 " launched — entry 0x%"
-                    PRIx64 " vcpus %u",
+                    PRIx64 " vcpus %u (host_addr sealed)",
                     plane_id, entry_point, ps->vcpu_count);
         #undef PLANE_HOST
     }
+
+    run->hypercall.ret = 0;
+    return 0;
+}
+
+/*
+ * VBS VTL call handler — plane-0 guest issues KVM_HC_VBS_VTL_CALL with the
+ * GPA of a shared calling-area (CAA) page.  QEMU reads the request from that
+ * page, dispatches it (currently stubbed), and writes the response back.
+ *
+ * CAA page layout (matches struct vbs_kvm_ca in the guest kernel):
+ *   offset 0:  u8  call_pending
+ *   offset 1:  u8  rsvd[3]
+ *   offset 4:  u32 call_id
+ *   offset 8:  s32 status       (written by responder)
+ *   offset 12: u32 arg_size
+ *   offset 16: u32 resp_size    (written by responder)
+ *   offset 20: u8  buffer[]
+ */
+static int kvm_handle_hc_vbs_vtl_call(X86CPU *cpu, struct kvm_run *run)
+{
+    uint64_t ca_gpa = run->hypercall.args[0];
+    uint32_t call_id;
+    int32_t status;
+
+    /* Read call_id from offset 4 of the CAA page */
+    cpu_physical_memory_read(ca_gpa + 4, &call_id, sizeof(call_id));
+
+    info_report("vbs_vtl_call: call_id=0x%04x from GPA 0x%" PRIx64,
+                call_id, ca_gpa);
+
+    /*
+     * TODO: dispatch to plane-1's secure kernel.  For now, return
+     * -ENOSYS so the guest knows the responder is not yet active.
+     */
+    status = -38; /* -ENOSYS */
+    cpu_physical_memory_write(ca_gpa + 8, &status, sizeof(status));
 
     run->hypercall.ret = 0;
     return 0;
@@ -7533,6 +7607,8 @@ static int kvm_handle_hypercall(X86CPU *cpu, struct kvm_run *run)
         return kvm_handle_hc_vm_planes_config(cpu, run);
     if (run->hypercall.nr == KVM_HC_VM_PLANES_ACTIVATE)
         return kvm_handle_hc_vm_planes_activate(cpu, run);
+    if (run->hypercall.nr == KVM_HC_VBS_VTL_CALL)
+        return kvm_handle_hc_vbs_vtl_call(cpu, run);
 
     return -EINVAL;
 }
