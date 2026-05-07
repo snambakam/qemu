@@ -1653,6 +1653,19 @@ struct kvm_memory_attributes {
 };
 
 #define KVM_MEMORY_ATTRIBUTE_PRIVATE           (1ULL << 3)
+#define KVM_MEMORY_ATTRIBUTE_NO_WRITE          (1ULL << 4)
+#define KVM_MEMORY_ATTRIBUTE_NO_EXEC           (1ULL << 5)
+
+/* Set memory attributes on a specific plane's address space. */
+struct kvm_plane_memory_attributes {
+	__u32 plane;
+	__u32 flags;
+	__u64 address;
+	__u64 size;
+	__u64 attributes;
+};
+
+#define KVM_SET_PLANE_MEMORY_ATTRIBUTES	_IOW(KVMIO, 0xd6, struct kvm_plane_memory_attributes)
 
 #define KVM_MEMORY_ATTRIBUTE_NO_WRITE          (1ULL << 4)
 #define KVM_MEMORY_ATTRIBUTE_NO_EXEC           (1ULL << 5)
