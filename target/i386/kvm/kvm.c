@@ -7565,7 +7565,7 @@ static int kvm_handle_hc_vm_planes_activate(X86CPU *cpu, struct kvm_run *run)
 /*
  * VBS VTL call handler — plane-0 guest issues KVM_HC_VBS_VTL_CALL with the
  * GPA of a shared calling-area (CAA) page.  QEMU reads the request from that
- * page, dispatches it (currently stubbed), and writes the response back.
+ * page, dispatches it, and writes the response back.
  *
  * CAA page layout (matches struct vbs_kvm_ca in the guest kernel):
  *   offset 0:  u8  call_pending
@@ -7576,24 +7576,164 @@ static int kvm_handle_hc_vm_planes_activate(X86CPU *cpu, struct kvm_run *run)
  *   offset 16: u32 resp_size    (written by responder)
  *   offset 20: u8  buffer[]
  */
+
+/* VBS call IDs — must match enum vbs_call_id in include/linux/vbs.h */
+#define VBS_CALL_INIT             0x0001
+#define VBS_CALL_SHUTDOWN         0x0002
+#define VBS_CALL_PROTECT_MEMORY   0x0100
+#define VBS_CALL_SEAL_KERNEL      0x0101
+
+/* CAA page field offsets */
+#define CA_OFF_CALL_ID    4
+#define CA_OFF_STATUS     8
+#define CA_OFF_ARG_SIZE   12
+#define CA_OFF_RESP_SIZE  16
+#define CA_OFF_BUFFER     20
+
+/*
+ * Apply memory protection on a GPA range for plane-0.
+ * perms: VBS_MEM_* flags (1=READ, 2=WRITE, 4=EXEC).
+ * We translate to KVM_MEMORY_ATTRIBUTE_NO_WRITE / NO_EXEC.
+ */
+static int vbs_apply_protection(KVMState *s, uint64_t gpa, uint64_t size,
+                                uint32_t perms)
+{
+    uint64_t attrs = 0;
+
+    if (!(perms & 2))  /* no VBS_MEM_WRITE → set NO_WRITE */
+        attrs |= KVM_MEMORY_ATTRIBUTE_NO_WRITE;
+    if (!(perms & 4))  /* no VBS_MEM_EXEC → set NO_EXEC */
+        attrs |= KVM_MEMORY_ATTRIBUTE_NO_EXEC;
+
+    if (!attrs) {
+        return 0;  /* nothing to restrict */
+    }
+
+    struct kvm_plane_memory_attributes pattrs = {
+        .plane      = 0,
+        .flags      = 0,
+        .address    = gpa,
+        .size       = size,
+        .attributes = attrs,
+    };
+
+    return kvm_vm_ioctl(s, KVM_SET_PLANE_MEMORY_ATTRIBUTES, &pattrs);
+}
+
+/*
+ * Handle VBS_CALL_PROTECT_MEMORY — set EPT permissions on a GPA range.
+ * Payload (20 bytes):
+ *   u64 gpa, u64 size, u32 perms, u32 flags
+ */
+static int32_t vbs_handle_protect_memory(KVMState *s, uint64_t ca_gpa)
+{
+    uint64_t gpa, size;
+    uint32_t perms, arg_size;
+    int ret;
+
+    cpu_physical_memory_read(ca_gpa + CA_OFF_ARG_SIZE, &arg_size,
+                             sizeof(arg_size));
+    if (arg_size < 24) {
+        return -22;  /* -EINVAL */
+    }
+
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 0, &gpa, 8);
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 8, &size, 8);
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 16, &perms, 4);
+
+    info_report("vbs: PROTECT_MEMORY gpa=0x%" PRIx64 " size=0x%" PRIx64
+                " perms=0x%x", gpa, size, perms);
+
+    ret = vbs_apply_protection(s, gpa, size, perms);
+    if (ret < 0) {
+        warn_report("vbs: PROTECT_MEMORY failed (err %d)", ret);
+        return ret;
+    }
+    return 0;
+}
+
+/*
+ * Handle VBS_CALL_SEAL_KERNEL — make kernel text and rodata immutable.
+ * Payload (40 bytes):
+ *   u64 text_gpa, u64 text_size, u64 rodata_gpa, u64 rodata_size, u64 cr3
+ */
+static int32_t vbs_handle_seal_kernel(KVMState *s, uint64_t ca_gpa)
+{
+    uint64_t text_gpa, text_size, rodata_gpa, rodata_size, cr3;
+    uint32_t arg_size;
+    int ret;
+
+    cpu_physical_memory_read(ca_gpa + CA_OFF_ARG_SIZE, &arg_size,
+                             sizeof(arg_size));
+    if (arg_size < 40) {
+        return -22;  /* -EINVAL */
+    }
+
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 0,  &text_gpa, 8);
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 8,  &text_size, 8);
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 16, &rodata_gpa, 8);
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 24, &rodata_size, 8);
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 32, &cr3, 8);
+
+    info_report("vbs: SEAL_KERNEL text=[0x%" PRIx64 "+0x%" PRIx64
+                "] rodata=[0x%" PRIx64 "+0x%" PRIx64 "] cr3=0x%" PRIx64,
+                text_gpa, text_size, rodata_gpa, rodata_size, cr3);
+
+    /* Protect kernel text: read-only + executable (set NO_WRITE) */
+    ret = vbs_apply_protection(s, text_gpa, text_size, 1 | 4);  /* R+X */
+    if (ret < 0) {
+        warn_report("vbs: SEAL_KERNEL text protection failed (err %d)", ret);
+        return ret;
+    }
+    info_report("vbs: kernel text [0x%" PRIx64 "+0x%" PRIx64
+                "] sealed (NO_WRITE)", text_gpa, text_size);
+
+    /* Protect kernel rodata: read-only + no-exec (set NO_WRITE|NO_EXEC) */
+    ret = vbs_apply_protection(s, rodata_gpa, rodata_size, 1);  /* R only */
+    if (ret < 0) {
+        warn_report("vbs: SEAL_KERNEL rodata protection failed (err %d)", ret);
+        return ret;
+    }
+    info_report("vbs: kernel rodata [0x%" PRIx64 "+0x%" PRIx64
+                "] sealed (NO_WRITE|NO_EXEC)", rodata_gpa, rodata_size);
+
+    return 0;
+}
+
 static int kvm_handle_hc_vbs_vtl_call(X86CPU *cpu, struct kvm_run *run)
 {
     uint64_t ca_gpa = run->hypercall.args[0];
     uint32_t call_id;
     int32_t status;
+    KVMState *s = kvm_state;
 
     /* Read call_id from offset 4 of the CAA page */
-    cpu_physical_memory_read(ca_gpa + 4, &call_id, sizeof(call_id));
+    cpu_physical_memory_read(ca_gpa + CA_OFF_CALL_ID, &call_id,
+                             sizeof(call_id));
 
-    info_report("vbs_vtl_call: call_id=0x%04x from GPA 0x%" PRIx64,
-                call_id, ca_gpa);
+    switch (call_id) {
+    case VBS_CALL_INIT:
+        info_report("vbs: INIT — plane-0 VBS subsystem ready");
+        status = 0;
+        break;
+    case VBS_CALL_SHUTDOWN:
+        info_report("vbs: SHUTDOWN — plane-0 VBS shutting down");
+        status = 0;
+        break;
+    case VBS_CALL_PROTECT_MEMORY:
+        status = vbs_handle_protect_memory(s, ca_gpa);
+        break;
+    case VBS_CALL_SEAL_KERNEL:
+        status = vbs_handle_seal_kernel(s, ca_gpa);
+        break;
+    default:
+        info_report("vbs: unhandled call_id=0x%04x", call_id);
+        status = -38;  /* -ENOSYS */
+        break;
+    }
 
-    /*
-     * TODO: dispatch to plane-1's secure kernel.  For now, return
-     * -ENOSYS so the guest knows the responder is not yet active.
-     */
-    status = -38; /* -ENOSYS */
-    cpu_physical_memory_write(ca_gpa + 8, &status, sizeof(status));
+    /* Write status back to the CAA page */
+    cpu_physical_memory_write(ca_gpa + CA_OFF_STATUS, &status, sizeof(status));
 
     run->hypercall.ret = 0;
     return 0;
