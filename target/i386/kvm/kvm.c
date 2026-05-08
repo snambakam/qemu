@@ -7585,6 +7585,8 @@ static int kvm_handle_hc_vm_planes_activate(X86CPU *cpu, struct kvm_run *run)
 #define VBS_CALL_VALIDATE_MODULE  0x0200
 #define VBS_CALL_SET_MODULE_PERMS 0x0201
 #define VBS_CALL_UNLOAD_MODULE    0x0202
+#define VBS_CALL_KEXEC_VALIDATE   0x0400
+#define VBS_CALL_KEXEC_INVALIDATE 0x0401
 
 /* CAA page field offsets */
 #define CA_OFF_CALL_ID    4
@@ -7815,6 +7817,37 @@ static int32_t vbs_handle_unload_module(uint64_t ca_gpa)
     return 0;
 }
 
+/*
+ * Handle VBS_CALL_KEXEC_VALIDATE — validate a kexec kernel image.
+ * Payload (24 bytes): u64 kernel_gpa, u64 kernel_size, u32 sig_ok, u32 flags
+ */
+static int32_t vbs_handle_kexec_validate(uint64_t ca_gpa)
+{
+    uint64_t kernel_gpa, kernel_size;
+    uint32_t sig_ok, arg_size;
+
+    cpu_physical_memory_read(ca_gpa + CA_OFF_ARG_SIZE, &arg_size,
+                             sizeof(arg_size));
+    if (arg_size < 24) {
+        return -22;
+    }
+
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 0,  &kernel_gpa, 8);
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 8,  &kernel_size, 8);
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 16, &sig_ok, 4);
+
+    info_report("vbs: KEXEC_VALIDATE gpa=0x%" PRIx64 " size=0x%" PRIx64
+                " sig_ok=%u", kernel_gpa, kernel_size, sig_ok);
+
+    if (!sig_ok) {
+        warn_report("vbs: kexec kernel not signature-verified — rejecting");
+        return -126;  /* -EKEYREJECTED */
+    }
+
+    info_report("vbs: kexec kernel signature verified — approved");
+    return 0;
+}
+
 static int kvm_handle_hc_vbs_vtl_call(X86CPU *cpu, struct kvm_run *run)
 {
     uint64_t ca_gpa = run->hypercall.args[0];
@@ -7849,6 +7882,13 @@ static int kvm_handle_hc_vbs_vtl_call(X86CPU *cpu, struct kvm_run *run)
         break;
     case VBS_CALL_UNLOAD_MODULE:
         status = vbs_handle_unload_module(ca_gpa);
+        break;
+    case VBS_CALL_KEXEC_VALIDATE:
+        status = vbs_handle_kexec_validate(ca_gpa);
+        break;
+    case VBS_CALL_KEXEC_INVALIDATE:
+        info_report("vbs: KEXEC_INVALIDATE — kexec image freed");
+        status = 0;
         break;
     default:
         info_report("vbs: unhandled call_id=0x%04x", call_id);
