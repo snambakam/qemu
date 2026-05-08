@@ -7582,6 +7582,9 @@ static int kvm_handle_hc_vm_planes_activate(X86CPU *cpu, struct kvm_run *run)
 #define VBS_CALL_SHUTDOWN         0x0002
 #define VBS_CALL_PROTECT_MEMORY   0x0100
 #define VBS_CALL_SEAL_KERNEL      0x0101
+#define VBS_CALL_VALIDATE_MODULE  0x0200
+#define VBS_CALL_SET_MODULE_PERMS 0x0201
+#define VBS_CALL_UNLOAD_MODULE    0x0202
 
 /* CAA page field offsets */
 #define CA_OFF_CALL_ID    4
@@ -7700,6 +7703,118 @@ static int32_t vbs_handle_seal_kernel(KVMState *s, uint64_t ca_gpa)
     return 0;
 }
 
+/*
+ * Handle VBS_CALL_VALIDATE_MODULE — verify a kernel module's signature.
+ * Payload (88 bytes):
+ *   char name[56], u64 elf_gpa, u64 elf_size, u64 sig_gpa, u64 sig_size
+ *
+ * For now, log the request and approve.  A full implementation would
+ * read the module from guest memory and verify its PKCS#7 signature
+ * against a trusted keyring.
+ */
+static int32_t vbs_handle_validate_module(KVMState *s, uint64_t ca_gpa)
+{
+    char name[56];
+    uint64_t elf_gpa, elf_size;
+    uint32_t sig_ok, arg_size;
+
+    cpu_physical_memory_read(ca_gpa + CA_OFF_ARG_SIZE, &arg_size,
+                             sizeof(arg_size));
+    if (arg_size < 80) {
+        return -22;  /* -EINVAL */
+    }
+
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 0,  name, 56);
+    name[55] = '\0';
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 56, &elf_gpa, 8);
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 64, &elf_size, 8);
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 72, &sig_ok, 4);
+
+    info_report("vbs: VALIDATE_MODULE '%s' elf=[0x%" PRIx64 "+0x%" PRIx64
+                "] sig_ok=%u",
+                name, elf_gpa, elf_size, sig_ok);
+
+    if (!sig_ok) {
+        warn_report("vbs: module '%s' not signature-verified — rejecting",
+                     name);
+        return -126;  /* -EKEYREJECTED */
+    }
+
+    info_report("vbs: module '%s' signature verified by kernel — approved",
+                name);
+    return 0;
+}
+
+/*
+ * Handle VBS_CALL_SET_MODULE_PERMS — apply EPT permissions per section.
+ * Payload: header (64 bytes) + sections[] (24 bytes each)
+ */
+static int32_t vbs_handle_set_module_perms(KVMState *s, uint64_t ca_gpa)
+{
+    char name[56];
+    uint32_t nr_sections, arg_size;
+    int ret;
+
+    cpu_physical_memory_read(ca_gpa + CA_OFF_ARG_SIZE, &arg_size,
+                             sizeof(arg_size));
+    if (arg_size < 64) {
+        return -22;
+    }
+
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 0, name, 56);
+    name[55] = '\0';
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 56, &nr_sections, 4);
+
+    info_report("vbs: SET_MODULE_PERMS '%s' sections=%u", name, nr_sections);
+
+    /* Each section is 24 bytes: u64 gpa, u64 size, u32 perms, u32 type */
+    for (uint32_t i = 0; i < nr_sections && i < 16; i++) {
+        uint64_t gpa, size;
+        uint32_t perms, type;
+        uint32_t off = 64 + i * 24;  /* after header */
+
+        cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + off + 0,  &gpa, 8);
+        cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + off + 8,  &size, 8);
+        cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + off + 16, &perms, 4);
+        cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + off + 20, &type, 4);
+
+        info_report("vbs:   section[%u] type=%u gpa=0x%" PRIx64
+                    " size=0x%" PRIx64 " perms=0x%x",
+                    i, type, gpa, size, perms);
+
+        if (!size)
+            continue;
+
+        ret = vbs_apply_protection(s, gpa, size, perms);
+        if (ret < 0) {
+            warn_report("vbs: section[%u] protection failed (err %d)",
+                        i, ret);
+            /* Continue with other sections — don't fail the whole call */
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Handle VBS_CALL_UNLOAD_MODULE — release EPT overrides for a module.
+ */
+static int32_t vbs_handle_unload_module(uint64_t ca_gpa)
+{
+    char name[56];
+
+    cpu_physical_memory_read(ca_gpa + CA_OFF_BUFFER + 0, name, 56);
+    name[55] = '\0';
+
+    info_report("vbs: UNLOAD_MODULE '%s'", name);
+
+    /*
+     * TODO: Reset EPT permissions for the module's GPA ranges back
+     * to default (RWX).  For now, just log and acknowledge.
+     */
+    return 0;
+}
+
 static int kvm_handle_hc_vbs_vtl_call(X86CPU *cpu, struct kvm_run *run)
 {
     uint64_t ca_gpa = run->hypercall.args[0];
@@ -7725,6 +7840,15 @@ static int kvm_handle_hc_vbs_vtl_call(X86CPU *cpu, struct kvm_run *run)
         break;
     case VBS_CALL_SEAL_KERNEL:
         status = vbs_handle_seal_kernel(s, ca_gpa);
+        break;
+    case VBS_CALL_VALIDATE_MODULE:
+        status = vbs_handle_validate_module(s, ca_gpa);
+        break;
+    case VBS_CALL_SET_MODULE_PERMS:
+        status = vbs_handle_set_module_perms(s, ca_gpa);
+        break;
+    case VBS_CALL_UNLOAD_MODULE:
+        status = vbs_handle_unload_module(ca_gpa);
         break;
     default:
         info_report("vbs: unhandled call_id=0x%04x", call_id);
