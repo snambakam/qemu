@@ -6530,7 +6530,7 @@ static int kvm_handle_hc_map_gpa_range(X86CPU *cpu, struct kvm_run *run)
 /* VM planes ioctls/caps not yet in linux-headers — defined in kernel's kvm.h */
 #define KVM_CREATE_PLANE        _IO(0xAE, 0xd6)
 #define KVM_CREATE_VCPU_PLANE   _IO(0xAE, 0xd7)
-#define KVM_CAP_PLANES          248
+#define KVM_CAP_PLANES          249
 
 #define VM_PLANE_VCPUS_MAX      64
 
