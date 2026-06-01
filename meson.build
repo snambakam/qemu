@@ -55,7 +55,7 @@ qapi_trace_events = []
 bsd_oses = ['gnu/kfreebsd', 'freebsd', 'netbsd', 'openbsd', 'dragonfly', 'darwin']
 supported_oses = ['windows', 'freebsd', 'netbsd', 'openbsd', 'darwin', 'sunos', 'linux', 'emscripten']
 supported_cpus = ['ppc64', 's390x', 'riscv64', 'x86_64',
-  'aarch64', 'loongarch64', 'mips64', 'sparc64', 'wasm64']
+  'aarch64', 'loongarch64', 'sparc64', 'wasm64']
 
 cpu = host_machine.cpu_family()
 
@@ -282,8 +282,6 @@ elif cpu == 's390x'
   kvm_targets = ['s390x-softmmu']
 elif cpu == 'ppc64'
   kvm_targets = ['ppc-softmmu', 'ppc64-softmmu']
-elif cpu == 'mips64'
-  kvm_targets = ['mips-softmmu', 'mipsel-softmmu', 'mips64-softmmu', 'mips64el-softmmu']
 elif cpu == 'riscv64'
   kvm_targets = ['riscv64-softmmu']
 elif cpu == 'loongarch64'
@@ -1662,43 +1660,6 @@ if not get_option('rbd').auto() or have_block
   endif
 endif
 
-glusterfs = not_found
-glusterfs_ftruncate_has_stat = false
-glusterfs_iocb_has_stat = false
-if not get_option('glusterfs').auto() or have_block
-  glusterfs = dependency('glusterfs-api', version: '>=3',
-                         required: get_option('glusterfs'),
-                         method: 'pkg-config')
-  if glusterfs.found()
-    glusterfs_ftruncate_has_stat = cc.links('''
-      #include <glusterfs/api/glfs.h>
-
-      int
-      main(void)
-      {
-          /* new glfs_ftruncate() passes two additional args */
-          return glfs_ftruncate(NULL, 0, NULL, NULL);
-      }
-    ''', dependencies: glusterfs)
-    glusterfs_iocb_has_stat = cc.links('''
-      #include <glusterfs/api/glfs.h>
-
-      /* new glfs_io_cbk() passes two additional glfs_stat structs */
-      static void
-      glusterfs_iocb(glfs_fd_t *fd, ssize_t ret, struct glfs_stat *prestat, struct glfs_stat *poststat, void *data)
-      {}
-
-      int
-      main(void)
-      {
-          glfs_io_cbk iocb = &glusterfs_iocb;
-          iocb(NULL, 0 , NULL, NULL, NULL);
-          return 0;
-      }
-    ''', dependencies: glusterfs)
-  endif
-endif
-
 hv_balloon = false
 if get_option('hv_balloon').allowed() and have_system
   if cc.links('''
@@ -2478,15 +2439,6 @@ config_host_data.set('CONFIG_CURL', curl.found())
 config_host_data.set('CONFIG_CURSES', curses.found())
 config_host_data.set('CONFIG_GBM', gbm.found())
 config_host_data.set('CONFIG_GIO', gio.found())
-config_host_data.set('CONFIG_GLUSTERFS', glusterfs.found())
-if glusterfs.found()
-  config_host_data.set('CONFIG_GLUSTERFS_XLATOR_OPT', glusterfs.version().version_compare('>=4'))
-  config_host_data.set('CONFIG_GLUSTERFS_DISCARD', glusterfs.version().version_compare('>=5'))
-  config_host_data.set('CONFIG_GLUSTERFS_FALLOCATE', glusterfs.version().version_compare('>=6'))
-  config_host_data.set('CONFIG_GLUSTERFS_ZEROFILL', glusterfs.version().version_compare('>=6'))
-  config_host_data.set('CONFIG_GLUSTERFS_FTRUNCATE_HAS_STAT', glusterfs_ftruncate_has_stat)
-  config_host_data.set('CONFIG_GLUSTERFS_IOCB_HAS_STAT', glusterfs_iocb_has_stat)
-endif
 config_host_data.set('CONFIG_GTK', gtk.found())
 config_host_data.set('CONFIG_VTE', vte.found())
 config_host_data.set('CONFIG_HEXAGON_IDEF_PARSER', get_option('hexagon_idef_parser'))
@@ -2644,7 +2596,7 @@ if host_os == 'windows'
 endif
 
 # has_function
-config_host_data.set('CONFIG_CLOSE_RANGE', cc.has_function('close_range'))
+config_host_data.set('CONFIG_CLOSE_RANGE', cc.has_function('close_range', prefix: '#include <unistd.h>'))
 config_host_data.set('CONFIG_ACCEPT4', cc.has_function('accept4'))
 config_host_data.set('CONFIG_CLOCK_ADJTIME', cc.has_function('clock_adjtime'))
 config_host_data.set('CONFIG_DUP3', cc.has_function('dup3'))
@@ -3778,6 +3730,19 @@ subdir('fsdev')
 subdir('dump')
 subdir('accel')
 
+subdir('backends')
+subdir('configs/targets')
+subdir('disas')
+subdir('migration')
+subdir('monitor')
+subdir('net')
+subdir('replay')
+subdir('stats')
+subdir('tcg')
+subdir('fpu')
+subdir('plugins')
+subdir('ebpf')
+
 if have_system
   subdir('hw')
 else
@@ -3885,19 +3850,6 @@ system_ss.add(files('page-vary-system.c'))
 
 common_ss.add(files('target-info.c'))
 system_ss.add(files('target-info-qom.c'))
-
-subdir('backends')
-subdir('configs/targets')
-subdir('disas')
-subdir('migration')
-subdir('monitor')
-subdir('net')
-subdir('replay')
-subdir('stats')
-subdir('tcg')
-subdir('fpu')
-subdir('plugins')
-subdir('ebpf')
 
 if 'CONFIG_TCG' in config_all_accel
   subdir('contrib/plugins')
@@ -5014,7 +4966,6 @@ if host_os == 'windows'
   endif
 endif
 summary_info += {'seccomp support':   seccomp}
-summary_info += {'GlusterFS support': glusterfs}
 summary_info += {'hv-balloon support': hv_balloon}
 summary_info += {'TPM support':       have_tpm}
 summary_info += {'IGVM support':      igvm}
@@ -5060,14 +5011,6 @@ if host_arch == 'unknown'
     message('configure has succeeded and you can continue to build, but')
     message('QEMU will use a slow interpreter to emulate the target CPU.')
   endif
-elif host_arch == 'mips'
-  message()
-  warning('DEPRECATED HOST CPU')
-  message()
-  message('Support for CPU host architecture ' + cpu + ' is going to be')
-  message('dropped as soon as the QEMU project stops supporting Debian 12')
-  message('("Bookworm"). Going forward, the QEMU project will not guarantee')
-  message('that QEMU will compile or work on this host CPU.')
 endif
 
 if not supported_oses.contains(host_os)
