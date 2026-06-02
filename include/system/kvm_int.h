@@ -101,13 +101,21 @@ struct KVMDirtyRingReaper {
     volatile uint64_t reaper_iteration; /* iteration number of reaper thr */
     volatile enum KVMDirtyRingReaperState reaper_state; /* reap thr state */
 };
+
+/* VCPU per-plane state */
+struct KVMPlane {
+    int kvm_fd;
+    int kvm_vcpu_stats_fd;
+    bool vcpu_dirty;
+};
+
 struct KVMState
 {
     AccelState parent_obj;
     /* Max number of KVM slots supported */
     int nr_slots_max;
     int fd;
-    int vmfd;
+    int plane_fds[KVM_MAX_PLANES];
     int coalesced_mmio;
     int coalesced_pio;
     struct kvm_coalesced_mmio_ring *coalesced_mmio_ring;
@@ -169,6 +177,26 @@ struct KVMState
     char *device;
     OnOffAuto honor_guest_pat;
 };
+
+static inline void kvm_set_plane_fd(KVMState *s, unsigned plane, int fd)
+{
+    s->plane_fds[plane] = fd;
+}
+
+static inline int kvm_get_plane_fd(KVMState *s, unsigned plane)
+{
+    return s->plane_fds[plane];
+}
+
+static inline void kvm_set_vm_fd(KVMState *s, int vmfd)
+{
+    kvm_set_plane_fd(s, 0, vmfd);
+}
+
+static inline int kvm_vm_fd(KVMState *s)
+{
+    return kvm_get_plane_fd(s, 0);
+}
 
 void kvm_memory_listener_register(KVMState *s, KVMMemoryListener *kml,
                                   AddressSpace *as, int as_id, const char *name);
