@@ -21,6 +21,7 @@
 #include <sys/utsname.h>
 #include <sys/syscall.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
 
 #include <linux/kvm.h>
 #include <linux/kvm_para.h>
@@ -35,6 +36,8 @@
 #include "system/kvm_int.h"
 #include "system/runstate.h"
 #include "system/ramblock.h"
+#include "system/address-spaces.h"
+#include "system/memory.h"
 #include "kvm_i386.h"
 #include "../confidential-guest.h"
 #include "sev.h"
@@ -46,6 +49,7 @@
 #include "gdbstub/enums.h"
 #include "qemu/host-utils.h"
 #include "qemu/main-loop.h"
+#include "qemu/thread.h"
 #include "qemu/ratelimit.h"
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
