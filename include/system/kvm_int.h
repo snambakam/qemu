@@ -114,6 +114,7 @@ struct KVMPlane {
  * kvm_get_plane_fd(s, plane_id); only LVBS-specific state lives here. */
 struct kvm_vm_plane_state {
     int *vcpu_fds;
+    unsigned int *vcpu_cpu_index;  /* owning plane-0 CPU index per plane vCPU */
     unsigned int vcpu_count;
     uint64_t load_offset;
     uint64_t memory_size;
