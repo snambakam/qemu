@@ -13,6 +13,8 @@
 
 struct AccelState {
     Object parent_obj;
+
+    AccelGdbConfig gdbstub;
 };
 
 struct AccelClass {
@@ -38,9 +40,6 @@ struct AccelClass {
 
     /* planes related hooks */
     uint8_t (*nr_planes)(AccelState *as, MachineState *ms);
-
-    /* gdbstub related hooks */
-    int (*gdbstub_supported_sstep_flags)(AccelState *as);
 
     bool *allowed;
     /*
