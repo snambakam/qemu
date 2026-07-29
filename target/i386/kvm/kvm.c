@@ -21,6 +21,7 @@
 #include <sys/utsname.h>
 #include <sys/syscall.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
 
 #include <linux/kvm.h>
 #include <linux/kvm_para.h>
@@ -36,6 +37,8 @@
 #include "system/kvm_int.h"
 #include "system/runstate.h"
 #include "system/ramblock.h"
+#include "system/address-spaces.h"
+#include "system/memory.h"
 #include "kvm_i386.h"
 #include "../confidential-guest.h"
 #include "sev.h"
@@ -47,6 +50,7 @@
 #include "gdbstub/enums.h"
 #include "qemu/host-utils.h"
 #include "qemu/main-loop.h"
+#include "qemu/thread.h"
 #include "qemu/ratelimit.h"
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
@@ -6665,9 +6669,12 @@ static int kvm_handle_hc_vm_planes_config(X86CPU *cpu, struct kvm_run *run)
         int plane_fd;
         unsigned int i;
 
-        cpu_physical_memory_read(plane_gpa + 0,  &load_offset, 8);
-        cpu_physical_memory_read(plane_gpa + 8,  &memory_size, 8);
-        cpu_physical_memory_read(plane_gpa + 16, &entry_point, 8);
+        address_space_read(&address_space_memory, plane_gpa + 0,
+                           MEMTXATTRS_UNSPECIFIED, &load_offset, 8);
+        address_space_read(&address_space_memory, plane_gpa + 8,
+                           MEMTXATTRS_UNSPECIFIED, &memory_size, 8);
+        address_space_read(&address_space_memory, plane_gpa + 16,
+                           MEMTXATTRS_UNSPECIFIED, &entry_point, 8);
 
         /*
          * joergroedel plane model: a plane has exactly one vCPU per
@@ -6685,8 +6692,9 @@ static int kvm_handle_hc_vm_planes_config(X86CPU *cpu, struct kvm_run *run)
         }
 
         memset(cmdline_buf, 0, sizeof(cmdline_buf));
-        cpu_physical_memory_read(plane_gpa + 156, cmdline_buf,
-                                 sizeof(cmdline_buf));
+        address_space_read(&address_space_memory, plane_gpa + 156,
+                           MEMTXATTRS_UNSPECIFIED, cmdline_buf,
+                           sizeof(cmdline_buf));
         cmdline_buf[sizeof(cmdline_buf) - 1] = '\0';
         memcpy(ps->cmdline, cmdline_buf, sizeof(ps->cmdline));
 
@@ -6899,8 +6907,9 @@ static int kvm_handle_hc_vm_planes_activate(X86CPU *cpu, struct kvm_run *run)
             return 0;
         }
 
-        cpu_physical_memory_read(gpa + (plane_id * VM_PLANE_CFG_STRIDE) + 16,
-                                 &entry_point, 8);
+        address_space_read(&address_space_memory,
+                           gpa + (plane_id * VM_PLANE_CFG_STRIDE) + 16,
+                           MEMTXATTRS_UNSPECIFIED, &entry_point, 8);
         if (!entry_point) {
             error_report("vm_planes: plane %" PRIu64 " bad entry_point",
                          plane_id);
